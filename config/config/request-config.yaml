@@ -1,0 +1,8 @@
+# 好友申请是否上报
+friendAdd: true
+
+# 群聊邀请是否上报 (邀请机器人入群)
+groupInvite: true
+
+# 群聊申请是否上报 (申请加入群聊)
+groupAdd: true

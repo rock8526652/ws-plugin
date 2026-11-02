@@ -1,0 +1,23 @@
+# 群管理员变动是否上报
+groupAdmin: true
+
+# 群成员减少是否上报
+groupDecrease: true
+
+# 群成员增加是否上报
+groupIncrease: true
+
+# 群禁言是否上报
+groupBan: true
+
+# 好友添加是否上报
+friendIncrease: true
+
+# 群消息撤回是否上报
+groupRecall: true
+
+# 好友消息撤回是否上报
+friendRecall: true
+
+# 群内戳一戳是否上报
+groupPoke: true

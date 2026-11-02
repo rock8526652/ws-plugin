@@ -1,0 +1,115 @@
+# 心跳频率, 单位秒
+# 0 为关闭心跳
+heartbeatInterval: 5
+
+# 上报数据类型
+# 可选: 1:string, 2:array
+messagePostFormat: 2
+
+# 设置ws-plugin需要用到的端口
+wsPort: 54545
+
+# 是否忽略云崽配置文件的仅艾特
+ignoreOnlyReplyAt: false
+
+# gsuid_core上报前缀（按bot账号单独配置）
+# 键为bot账号(self_id)，值为要拼接在消息最前面的前缀
+#   - prefix: 前缀内容
+#   - skipIfHasPrefix: 有前缀不插入（默认 true）
+#     当命令去掉开头空白和/后，首字符是大小写字母或数字时，视为“已有前缀”
+#   - noPrefixCommands: 不加前缀命令（早柚有些命令没前缀，兼容一下）
+#     判断方式：去掉开头空白和/后，命令以配置项任一内容开头即命中
+# 示例：
+# gsuidBotPrefix:
+#   "123456":
+#     prefix: "cat"
+#     skipIfHasPrefix: true
+#     noPrefixCommands:
+#       - "扫码登陆"
+#   "234567":
+#     prefix: "dog"
+#     skipIfHasPrefix: false
+#     noPrefixCommands: []
+gsuidBotPrefix: {}
+
+# 是否单独添加仅艾特或前缀
+# 可以为每个连接单独添加
+onlyReplyAt:
+  enable: false
+  prefix:
+    - 示例前缀1
+  "ws_name":
+    enable: true
+    prefix:
+      - 单独连接示例前缀,ws_name是对应的连接名字
+
+# 连接服务列表
+# name: 连接名字  请保证每个名字都不相同,否则会出问题
+# address: 连接地址
+# type: 连接类型
+# reconnectInterval: 重连间隔 单位:秒
+# maxReconnectAttempts: 最大连接次数 0 为无限制
+# accessToken: 鉴权token
+# accessKey: 鉴权token的前缀 比如Bearer 默认为Token
+servers:
+  - name: ws_name
+    address: ws_address
+    type: 1
+    reconnectInterval: 5
+    maxReconnectAttempts: 0
+  - name: DDBOT
+    address: ws://127.0.0.1:15630/ws
+    type: 1
+    reconnectInterval: 5
+    maxReconnectAttempts: 0
+    uin: 2704573206
+    closed: true
+  - name: sakura
+    address: ws://127.0.0.1:1140/ws
+    type: 1
+    reconnectInterval: 5
+    maxReconnectAttempts: 0
+    closed: false
+  - name: xiaddbot
+    address: ws://127.0.0.1:11630/ws
+    type: 1
+    reconnectInterval: 5
+    maxReconnectAttempts: 0
+    uin: 3694842349
+    closed: true
+    rawName: xiaddbot
+  - name: xia寻
+    address: ws://127.0.0.1:10080/onebot/v11/ws
+    type: 1
+    reconnectInterval: 5
+    maxReconnectAttempts: 0
+    uin: 3694842349
+    closed: true
+  - name: yvmddbot
+    address: ws://127.0.0.1:12630/ws
+    type: 1
+    reconnectInterval: 5
+    maxReconnectAttempts: 0
+    uin: 1979503614
+    closed: false
+    rawName: yvmddbot
+  - name: ko
+    address: ws://127.0.0.1:2540/OneBotv11
+    type: 1
+    reconnectInterval: 5
+    maxReconnectAttempts: 0
+    closed: false
+    rawName: ko
+    uin:
+      - stdin
+      - 3658788664
+      - 1979503614
+    _uinResolved: true
+  - name: 早柚
+    address: http://127.0.0.1:8765/ws/Yunzai
+    type: 3
+    reconnectInterval: 5
+    maxReconnectAttempts: 0
+    uin: 3694842349
+    closed: true
+    rawName: 早柚
