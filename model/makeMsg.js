@@ -6,6 +6,7 @@ import common from '../../../lib/common/common.js'
 import { randomUUID } from 'crypto'
 import fs from 'fs'
 import fetch from 'node-fetch'
+import { normalizeSendSegments, resolveQuotedMessage } from './SakuraCompat.js'
 
 /**
  * 制作OneBot上报消息
@@ -39,7 +40,7 @@ async function makeOneBotReportMsg (e) {
   if (e.messagePostFormat == 'string' || e.messagePostFormat == '1') {
     reportMsg = raw_message
   }
-  setMsg({
+  await setMsg({
     message_id: e.message_id,
     time: e.time,
     seq: e.seq,
@@ -302,18 +303,23 @@ async function makeSendMsg (params, uin, adapter) {
   const bot = Bot[uin] || Bot
   let msg = params.message
   if (typeof msg == 'string') msg = CQToMsg(msg)
-  if (!Array.isArray(msg)) msg = [msg]
+  msg = normalizeSendSegments(msg)
   let target; let uid; let sendMsg = []; let quote = null
   for (const i of msg) {
     if (i.data.file) {
-      let file = decodeURIComponent(i.data.file)
+      // URL/base64 不需要整体解码；URL 内的 %25 等转义应交给协议端处理。
+      let file = i.data.file
+      if (Buffer.isBuffer(file)) file = `base64://${file.toString('base64')}`
+      if (typeof file !== 'string') throw new Error('媒体消息的 file 必须为字符串或 Buffer')
       if (file.startsWith('file:///')) {
-        if (fs.existsSync(file.replace('file:///', ''))) {
-          file = fs.readFileSync(file.replace('file:///', ''))
+        let localFile
+        try { localFile = decodeURIComponent(file) } catch { localFile = file }
+        if (fs.existsSync(localFile.replace('file:///', ''))) {
+          file = fs.readFileSync(localFile.replace('file:///', ''))
         } else
         // 有可能是linux
-          if (fs.existsSync(file.replace('file://', ''))) {
-            file = fs.readFileSync(file.replace('file://', ''))
+          if (fs.existsSync(localFile.replace('file://', ''))) {
+            file = fs.readFileSync(localFile.replace('file://', ''))
           }
       }
       i.data.file = file
@@ -328,10 +334,9 @@ async function makeSendMsg (params, uin, adapter) {
             seq: i.data.seq
           }
         } else {
-          quote = await getMsg({ onebot_id: i.data.id })
-          if (quote) {
-            quote = await bot.getMsg?.(quote.message_id)
-          }
+          const mapping = await getMsg({ onebot_id: i.data.id })
+          quote = await resolveQuotedMessage(bot, mapping)
+          if (!quote) logger.warn('[ws-plugin] 引用消息已过期或当前协议无法获取原消息')
           // else {
           //     sendMsg.push(MsgToCQ([i]))
           // }
@@ -466,7 +471,7 @@ async function makeForwardMsg (params, uin, adapter) {
         ...params,
         message: i
       }
-      let { sendMsg } = await makeSendMsg(data)
+      let { sendMsg } = await makeSendMsg(data, uin, adapter)
       forwardMsg.push({
         nickname: msg.data.nickname,
         user_id: Number(msg.data.user_id),
@@ -532,7 +537,7 @@ async function msgToOneBotMsg (msg, e) {
         if (e.source.user_id !== undefined) storeData.user_id = Number(e.source.user_id)
         if (e.group_id !== undefined) storeData.group_id = Number(e.group_id)
         if (e.user_id !== undefined && !storeData.group_id) storeData.user_id = Number(e.user_id)
-        setMsg(storeData)
+        await setMsg(storeData)
         reportMsg.push({
           type: 'reply',
           data: {
@@ -684,7 +689,7 @@ async function msgToOneBotMsg (msg, e) {
             })
           } else {
             const fallbackId = Math.floor(Math.random() * Math.pow(2, 32)) | 0
-            setMsg({
+            await setMsg({
               message_id: replyId,
               onebot_id: fallbackId,
               group_id: e?.group_id ? Number(e.group_id) : undefined,

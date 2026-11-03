@@ -18,7 +18,7 @@ export default class Client {
     this.reconnectInterval = reconnectInterval
     this.maxReconnectAttempts = maxReconnectAttempts
     this.accessToken = accessToken
-    this.accessKey = accessKey?.trim?.() || 'Token'
+    this.accessKey = accessKey?.trim?.() || 'Bearer'
     this.uin = Number(uin) || uin
     this.self_id = Number(uin) || uin
     this.ws = null
@@ -461,6 +461,7 @@ export default class Client {
         status: 'failed',
         retcode: -1,
         msg: error.message,
+        message: error.message,
         wording: 'ws-plugin获取信息失败',
         echo
       }

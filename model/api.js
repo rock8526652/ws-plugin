@@ -7,6 +7,7 @@ import common from '../../../lib/common/common.js'
 import { Version } from '../components/index.js'
 import { makeSendMsg, makeForwardMsg, msgToOneBotMsg } from './makeMsg.js'
 import { getMsg, setMsg, getLatestMsg, getUser_id, getGroup_id } from './DataBase.js'
+import { resolveQuotedMessage } from './SakuraCompat.js'
 
 async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
   const bot = Bot[uin] || Bot
@@ -183,35 +184,12 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
       const oldMsg = await getMsg({ onebot_id: params.message_id })
       logger.debug(`[ws-plugin] get_msg 数据库查找结果 oldMsg: ${JSON.stringify(oldMsg)}`)
       if (oldMsg) {
-        let msg
-        try {
-          msg = await bot.getMsg?.(oldMsg.message_id)
-        } catch (e) {
-          logger.debug(`[ws-plugin] get_msg: bot.getMsg 抛出异常: ${e?.message || e}`)
-        }
-        if (!msg) {
-          try {
-            if (oldMsg.group_id) {
-              msg = await bot.pickGroup(oldMsg.group_id)?.getMsg?.(oldMsg.message_id)
-              if (!msg) {
-                const history = await bot.pickGroup(oldMsg.group_id)?.getChatHistory?.(oldMsg.seq, 1)
-                if (history && history.length > 0) msg = history[0]
-              }
-            } else if (oldMsg.user_id) {
-              msg = await bot.pickFriend(oldMsg.user_id)?.getMsg?.(oldMsg.message_id)
-              if (!msg) {
-                const history = await bot.pickFriend(oldMsg.user_id)?.getChatHistory?.(oldMsg.time, 1)
-                if (history && history.length > 0) msg = history[0]
-              }
-            }
-          } catch (e) {
-            logger.debug(`[ws-plugin] get_msg: pickGroup/Friend.getMsg 抛出异常: ${e?.message || e}`)
-          }
-        }
+        const msg = await resolveQuotedMessage(bot, oldMsg)
         logger.debug(`[ws-plugin] get_msg 协议端获取消息结果: ${msg ? '成功' : '失败'}`)
         if (msg) {
           const message = await msgToOneBotMsg(msg.message)
-          msg.sender.level = String(msg.sender.level);
+          msg.sender ||= { user_id: msg.user_id }
+          if (msg.sender.level != null) msg.sender.level = String(msg.sender.level)
           ResponseData = {
             time: msg.time,
             message_type: 'private',
@@ -1350,7 +1328,7 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
         message_id: onebot_id
       }
       if (sendRet.message_id) {
-        setMsg({
+        await setMsg({
           message_id: sendRet.message_id,
           time: sendRet.time,
           seq: sendRet.seq,
