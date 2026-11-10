@@ -140,3 +140,55 @@ test('直接连接未经修改的 Sakura OB11 反向端完成发送和引用', a
   assert.equal(f.sent[0].message[1].file, 'base64://aW1hZ2U=')
   await assert.rejects(sakura.send('send_group_msg', { group_id: 456, message: [null] }, { selfId: 123 }), /无效/)
 })
+
+test('Sakura 兼容：表情包 sub_type、合并转发节点不拆分、multimsg 上报', async () => {
+  const f = await fixture()
+  const sticker = await f.msg.makeSendMsg({ message: [{ type: 'image', data: { file: 'https://a/b.gif', sub_type: 1 } }] }, 123)
+  assert.equal(sticker.sendMsg[0].asface, true)
+  const fwd = await f.msg.makeForwardMsg({ group_id: 456, messages: [{ type: 'node', data: { user_id: 1, nickname: 'n',
+    content: [{ type: 'text', data: { text: 'a' } }, { type: 'image', data: { file: 'https://a/c.png' } }] } }] }, 123)
+  assert.equal(fwd.data.length, 1)
+  assert.equal(fwd.data[0].message.length, 2)
+  const report = await f.msg.msgToOneBotMsg([{ type: 'multimsg', resid: 'RES1' }, { type: 'image', file: 'x', asface: true }], { group_id: 456 })
+  assert.equal(JSON.stringify(report[0]), JSON.stringify({ type: 'forward', data: { id: 'RES1' } }))
+  assert.equal(report[1].data.sub_type, 1)
+})
+
+test('引用回复时去掉 ICQQ 自动附带的 @被引用者，与 NapCat 对齐', async () => {
+  const f = await fixture()
+  f.mappings.set(9, { message_id: 'native-9', onebot_id: 9, group_id: 456, seq: 9 })
+  const msg = await f.msg.msgToOneBotMsg([{ type: 'reply', id: 'native-9' }, { type: 'at', qq: 1979503614 }, { type: 'text', text: ' -你看得到吗' }],
+    { group_id: 456, user_id: 789 })
+  assert.equal(msg.length, 2)
+  assert.equal(msg[0].type, 'reply')
+  assert.equal(msg[1].data.text, '-你看得到吗')
+  const keep = await f.msg.msgToOneBotMsg([{ type: 'at', qq: 1 }, { type: 'text', text: ' hi' }], { group_id: 456 })
+  assert.equal(keep[0].type, 'at')
+})
+
+test('get_forward_msg 按上报时记录的群聊来源下载合并转发', async () => {
+  const f = await fixture()
+  const calls = []
+  f.account.pickGroup = gid => ({ getForwardMsg: async resid => { calls.push([gid, resid]); return [{ user_id: 1, nickname: 'a', time: 1, message: [{ type: 'text', text: '转发内容' }] }] } })
+  f.account.getForwardMsg = async () => { throw new Error('私聊下载不应被优先调用') }
+  await f.msg.msgToOneBotMsg([{ type: 'multimsg', resid: 'RES2' }], { group_id: 456 })
+  const res = await f.api.getApiData('get_forward_msg', { message_id: 'RES2' }, 'Sakura', 123)
+  assert.equal(calls[0][0], 456)
+  assert.equal(res.messages[0].message[0].data.text, '转发内容')
+  assert.equal(res.messages[0].sender.nickname, 'a')
+})
+
+test('get_msg 的 message_seq 为真实 seq，负数 onebot_id 不会被 Sakura 判为未落地', async () => {
+  const f = await fixture()
+  f.mappings.set(-2124751354, { message_id: 'native-9', onebot_id: -2124751354, group_id: 456, seq: 9 })
+  const res = await f.api.getApiData('get_msg', { message_id: -2124751354 }, 'Sakura', 123)
+  assert.equal(res.message_id, -2124751354)
+  assert.equal(res.message_seq, 9)
+  assert.equal(res.real_id, 9)
+  assert.ok(res.message_seq > 0)
+})
+
+test('未适配的 API 返回失败而不是空成功', async () => {
+  const f = await fixture()
+  await assert.rejects(f.api.getApiData('definitely_not_exist_api', {}, 'Sakura', 123))
+})

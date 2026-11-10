@@ -6,7 +6,7 @@ import common from '../../../lib/common/common.js'
 import { randomUUID } from 'crypto'
 import fs from 'fs'
 import fetch from 'node-fetch'
-import { normalizeSendSegments, resolveQuotedMessage } from './SakuraCompat.js'
+import { normalizeSendSegments, resolveQuotedMessage, rememberResource, isStickerSegment, extractForwardResid, rememberGroupSeq, findOnebotIdBySeq } from './SakuraCompat.js'
 
 /**
  * 制作OneBot上报消息
@@ -49,6 +49,7 @@ async function makeOneBotReportMsg (e) {
     group_id: e.group_id,
     onebot_id: e.param.message_id
   })
+  if (e.group_id) rememberGroupSeq(e.group_id, e.seq, e.param.message_id)
   let Message = {
     message: reportMsg,
     raw_message,
@@ -342,9 +343,14 @@ async function makeSendMsg (params, uin, adapter) {
           // }
         }
         break
-      case 'image':
-        sendMsg.push(segment.image(i.data.file))
+      case 'image': {
+        const img = segment.image(i.data.file)
+        if (isStickerSegment(i.data)) {
+          img.asface = true
+        }
+        sendMsg.push(img)
         break
+      }
       case 'text':
         sendMsg.push(decodeHtml(i.data.text == null ? '' : String(i.data.text)))
         break
@@ -401,7 +407,7 @@ async function makeSendMsg (params, uin, adapter) {
         if (params.group_id) {
           await bot.pickGroup(params.group_id)?.pokeMember?.(Number(i.data.qq))
         } else if (params.user_id) {
-          await bot.pickFriend(params.user_id)?.poke?.(true)
+          await bot.pickFriend(params.user_id)?.poke?.()
         }
         break
       case 'record':
@@ -439,51 +445,58 @@ async function makeForwardMsg (params, uin, adapter) {
   let forwardMsg = []
   if (!Array.isArray(params.messages)) params.messages = [params.messages]
   for (const msg of params.messages) {
-    if (typeof msg.data.content == 'string') {
-      msg.data.content = [CQToMsg(msg.data.content)]
+    if (!msg?.data) continue
+    let content = msg.data.content
+    if (typeof content === 'string') {
+      content = CQToMsg(content)
     }
-    if (msg.data.content.type == 'image') {
-      msg.data.content = [{
+    if (content?.type === 'image') {
+      content = [{
         type: 'image',
         data: {
-          file: msg.data.content.file || msg.data.content.data.file
+          file: content.file || content.data?.file
         }
       }]
     }
-    if (!Array.isArray(msg.data.content)) {
-      msg.data.content = [msg.data.content]
+    if (!Array.isArray(content)) {
+      content = [content]
     }
-    let node = null
-    for (let i of msg.data.content) {
-      if (i.type == 'node') {
-        if (node) {
-          node.messages.push({ data: i.data })
-        } else {
-          node = {
-            ...params,
-            messages: [{ data: i.data }]
-          }
-        }
-        continue
+
+    const normalSegments = []
+    const childNodes = []
+    for (let item of content) {
+      if (item?.type === 'node') {
+        childNodes.push(item)
+      } else {
+        normalSegments.push(item)
       }
-      if (!Array.isArray(i)) i = [i]
+    }
+
+    const nickname = msg.data.name || msg.data.nickname || 'Bot'
+    const user_id = Number(msg.data.uin || msg.data.user_id) || 0
+
+    if (normalSegments.length > 0) {
       const data = {
         ...params,
-        message: i
+        message: normalSegments
       }
       let { sendMsg } = await makeSendMsg(data, uin, adapter)
       forwardMsg.push({
-        nickname: msg.data.nickname,
-        user_id: Number(msg.data.user_id),
+        nickname,
+        user_id,
         message: sendMsg
       })
     }
-    if (node) {
-      // C8修复: 统一字段名，同时兼容 name/uin 和 nickname/user_id
+
+    if (childNodes.length > 0) {
+      const childParams = {
+        ...params,
+        messages: childNodes
+      }
       forwardMsg.push({
-        nickname: msg.data.name || msg.data.nickname,
-        user_id: Number(msg.data.uin || msg.data.user_id),
-        message: await makeForwardMsg(node)
+        nickname,
+        user_id,
+        message: await makeForwardMsg(childParams, uin, adapter)
       })
     }
   }
@@ -492,6 +505,8 @@ async function makeForwardMsg (params, uin, adapter) {
     forwardMsg = await bot.pickGroup(params.group_id).makeForwardMsg?.(forwardMsg) || { type: 'node', data: forwardMsg }
   } else if (params.user_id) {
     forwardMsg = await bot.pickFriend(params.user_id).makeForwardMsg?.(forwardMsg) || { type: 'node', data: forwardMsg }
+  } else {
+    forwardMsg = await bot.makeForwardMsg?.(forwardMsg) || { type: 'node', data: forwardMsg }
   }
   return forwardMsg
 }
@@ -511,7 +526,17 @@ async function msgToOneBotMsg (msg, e) {
       }
       return obj
     }, {})
-    const replyMsg = await getMsg(getData)
+    // ICQQ 的 e.source 没有 message_id，且 QQNT 下 source.rand 与原消息 rand 不一致，
+    // 按 rand+seq 查常常落空；群内 seq 唯一，优先按 group_id+seq 查找原消息映射
+    let replyMsg = null
+    if (e.group_id && e.source.seq != null) {
+      const cached = findOnebotIdBySeq(e.group_id, e.source.seq)
+      if (cached != null) replyMsg = { onebot_id: cached }
+      if (!replyMsg) {
+        try { replyMsg = await getMsg({ group_id: Number(e.group_id), seq: e.source.seq }) } catch { }
+      }
+    }
+    if (!replyMsg) replyMsg = await getMsg(getData)
     logger.debug(`[ws-plugin] e.source 数据库查找结果: ${JSON.stringify(replyMsg)}`)
     if (replyMsg) {
       reportMsg.push({
@@ -576,16 +601,19 @@ async function msgToOneBotMsg (msg, e) {
           }
         })
         break
-      case 'image':
+      case 'image': {
+        const isSticker = Boolean(i.asface || i.sub_type === 1 || i.subType === 1)
         reportMsg.push({
           type: 'image',
           data: {
             file: i.file,
-            subType: i.asface ? 1 : 0,
+            sub_type: isSticker ? 1 : 0,
+            subType: isSticker ? 1 : 0,
             url: i.url
           }
         })
         break
+      }
       case 'mface':
       case 'marketface':
       case 'bface':
@@ -594,6 +622,7 @@ async function msgToOneBotMsg (msg, e) {
             type: 'image',
             data: {
               file: i.file || i.emojiId || i.id,
+              sub_type: 1,
               subType: 1,
               url: i.url
             }
@@ -622,7 +651,26 @@ async function msgToOneBotMsg (msg, e) {
         })
         break
       }
-      case 'json':
+      case 'multimsg': {
+        const resid = i.resid || i.id
+        if (resid) {
+          rememberResource(resid, { group_id: e?.group_id, user_id: e?.user_id })
+          reportMsg.push({
+            type: 'forward',
+            data: { id: resid }
+          })
+        }
+        break
+      }
+      case 'json': {
+        const resid = extractForwardResid('json', i.data)
+        if (resid) {
+          rememberResource(resid, { group_id: e?.group_id, user_id: e?.user_id })
+          reportMsg.push({
+            type: 'forward',
+            data: { id: resid }
+          })
+        }
         reportMsg.push({
           type: 'json',
           data: {
@@ -630,6 +678,7 @@ async function msgToOneBotMsg (msg, e) {
           }
         })
         break
+      }
       case 'face':
         reportMsg.push({
           type: 'face',
@@ -647,16 +696,29 @@ async function msgToOneBotMsg (msg, e) {
         })
         break
       // C1修复: 添加forward合并转发消息段处理
-      case 'forward':
+      case 'forward': {
+        const resid = i.id || i.resid || ''
+        if (resid) {
+          rememberResource(resid, { group_id: e?.group_id, user_id: e?.user_id })
+        }
         reportMsg.push({
           type: 'forward',
           data: {
-            id: i.id || i.resid || ''
+            id: resid
           }
         })
         break
+      }
       // C2修复: 添加xml消息段处理
-      case 'xml':
+      case 'xml': {
+        const resid = extractForwardResid('xml', i.data)
+        if (resid) {
+          rememberResource(resid, { group_id: e?.group_id, user_id: e?.user_id })
+          reportMsg.push({
+            type: 'forward',
+            data: { id: resid }
+          })
+        }
         reportMsg.push({
           type: 'xml',
           data: {
@@ -664,6 +726,7 @@ async function msgToOneBotMsg (msg, e) {
           }
         })
         break
+      }
       // C3修复: 添加poke戳一戳消息段处理
       case 'poke':
         reportMsg.push({
@@ -710,7 +773,32 @@ async function msgToOneBotMsg (msg, e) {
         break
     }
   }
+  stripAutoReplyAt(reportMsg, e)
   return reportMsg
+}
+
+/**
+ * ICQQ 在引用回复时会自动附带一个 @原消息作者（旧版 QQ 协议行为），
+ * 而 NapCat / QQNT 上报的引用消息没有这个 @。保留它会让 Sakura 等框架
+ * 以为消息以 @ 开头而无法匹配指令前缀，这里与 NapCat 行为对齐：
+ * 去掉紧跟在 reply 段后、指向被引用者的第一个 @ 及其后的空格。
+ */
+function stripAutoReplyAt (reportMsg, e) {
+  const replyIdx = reportMsg.findIndex(m => m.type === 'reply')
+  if (replyIdx === -1) return
+  const quotedUser = e?.source?.user_id
+  // 跳过 reply 之后的空白文本
+  let idx = replyIdx + 1
+  while (reportMsg[idx]?.type === 'text' && !String(reportMsg[idx].data?.text ?? '').trim()) idx++
+  const at = reportMsg[idx]
+  if (at?.type !== 'at' || at.data?.qq === 'all') return
+  if (quotedUser != null && String(at.data?.qq) !== String(quotedUser)) return
+  reportMsg.splice(replyIdx + 1, idx - replyIdx)
+  const next = reportMsg[replyIdx + 1]
+  if (next?.type === 'text' && typeof next.data?.text === 'string') {
+    next.data.text = next.data.text.replace(/^\s+/, '')
+    if (!next.data.text) reportMsg.splice(replyIdx + 1, 1)
+  }
 }
 
 export {

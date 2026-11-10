@@ -7,7 +7,67 @@ import common from '../../../lib/common/common.js'
 import { Version } from '../components/index.js'
 import { makeSendMsg, makeForwardMsg, msgToOneBotMsg } from './makeMsg.js'
 import { getMsg, setMsg, getLatestMsg, getUser_id, getGroup_id } from './DataBase.js'
-import { resolveQuotedMessage } from './SakuraCompat.js'
+import { resolveQuotedMessage, getResourceContext, rememberGroupSeq, extractForwardResid } from './SakuraCompat.js'
+import { reportSelfSent } from './sentReport.js'
+
+/**
+ * 把 ICQQ getChatHistory 返回的原生消息转换为 OB11 历史消息，
+ * 并为每条消息建立 onebot_id 映射，使 Sakura 可以对历史消息进行引用 / 回应 / 撤回。
+ */
+async function formatHistoryMessages (list, type) {
+  const messages = []
+  if (!Array.isArray(list)) return messages
+  for (const msg of list) {
+    try {
+      let mapping = msg.message_id ? await getMsg({ message_id: msg.message_id }) : null
+      let onebot_id = mapping?.onebot_id
+      if (onebot_id == null) {
+        onebot_id = Math.floor(Math.random() * Math.pow(2, 32)) | 0
+        await setMsg({
+          message_id: msg.message_id,
+          time: msg.time,
+          seq: msg.seq,
+          rand: msg.rand,
+          user_id: msg.user_id,
+          group_id: msg.group_id,
+          onebot_id
+        })
+      }
+      if (msg.group_id) rememberGroupSeq(msg.group_id, msg.seq, onebot_id)
+      const message = await msgToOneBotMsg(msg.message || [], { group_id: msg.group_id, user_id: msg.user_id })
+      const item = {
+        time: msg.time,
+        message_type: type,
+        message_id: onebot_id,
+        real_id: msg.seq,
+        message_seq: msg.seq,
+        user_id: await getUser_id({ user_id: msg.user_id }),
+        sender: {
+          user_id: await getUser_id({ user_id: msg.user_id }),
+          nickname: msg.nickname || msg.sender?.nickname || '',
+          card: msg.sender?.card || '',
+          role: msg.sender?.role || 'member'
+        },
+        message,
+        raw_message: MsgToCQ(message)
+      }
+      if (type === 'group') item.group_id = await getGroup_id({ group_id: msg.group_id })
+      messages.push(item)
+    } catch (e) {
+      // 跳过无法转换的消息
+    }
+  }
+  return messages
+}
+
+/** 按 onebot_id 取回原生消息（供单条转发使用） */
+async function fetchNativeMsg (bot, onebot_id) {
+  const mapping = await getMsg({ onebot_id })
+  if (!mapping) throw { message: `消息不存在: ${onebot_id}`, noLog: true }
+  const msg = await resolveQuotedMessage(bot, mapping)
+  if (!msg?.message) throw { message: '原消息已过期或协议端无法获取', noLog: true }
+  return msg
+}
 
 async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
   const bot = Bot[uin] || Bot
@@ -117,6 +177,23 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
     },
     // 删除单向好友
     // TODO delete_unidirectional_friend
+    // 设置好友备注 (NapCat 扩展)
+    set_friend_remark: async params => {
+      await bot.pickFriend(params.user_id)?.setRemark?.(params.remark)
+    },
+    // 好友戳一戳 (NapCat 扩展)
+    friend_poke: async params => {
+      await bot.pickFriend(params.user_id || params.target_id)?.poke?.()
+    },
+    // 群戳一戳 (NapCat 扩展)
+    group_poke: async params => {
+      await bot.pickGroup(params.group_id)?.pokeMember?.(Number(params.user_id || params.target_id))
+    },
+    // 通用戳一戳 (NapCat 扩展)
+    send_poke: async params => {
+      if (params.group_id) await bot.pickGroup(params.group_id)?.pokeMember?.(Number(params.user_id || params.target_id))
+      else await bot.pickFriend(params.user_id || params.target_id)?.poke?.()
+    },
 
     // --------------------------------------------------------
     // 消息
@@ -187,17 +264,18 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
         const msg = await resolveQuotedMessage(bot, oldMsg)
         logger.debug(`[ws-plugin] get_msg 协议端获取消息结果: ${msg ? '成功' : '失败'}`)
         if (msg) {
-          const message = await msgToOneBotMsg(msg.message)
+          const message = await msgToOneBotMsg(msg.message, { group_id: msg.group_id || oldMsg.group_id, user_id: msg.user_id || oldMsg.user_id, source: msg.source })
           msg.sender ||= { user_id: msg.user_id }
           if (msg.sender.level != null) msg.sender.level = String(msg.sender.level)
           ResponseData = {
             time: msg.time,
             message_type: 'private',
             sender: msg.sender,
-            real_id: Number(oldMsg.onebot_id || msg.seq),
-            message_id: Number(oldMsg.onebot_id || msg.rand),
-            seq: Number(oldMsg.onebot_id || msg.seq),
-            message_seq: Number(oldMsg.onebot_id || msg.seq),
+            real_id: Number(msg.seq ?? oldMsg.seq),
+            message_id: Number(oldMsg.onebot_id ?? msg.rand),
+            seq: Number(msg.seq ?? oldMsg.seq),
+            message_seq: Number(msg.seq ?? oldMsg.seq),
+            real_seq: String(msg.seq ?? oldMsg.seq),
             message,
             raw_message: MsgToCQ(message)
           }
@@ -207,6 +285,7 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
               ...ResponseData.sender,
               user_id
             }
+            ResponseData.user_id = user_id
           }
           if (msg.group_id) {
             ResponseData.message_type = 'group'
@@ -240,60 +319,108 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
     },
     // 标记消息已读
     mark_msg_as_read: async params => {
-      // TODO
+      const msg = params.message_id ? await getMsg({ onebot_id: params.message_id }) : null
+      if (msg?.group_id) await bot.pickGroup(msg.group_id)?.markRead?.(msg.seq)
+      else if (msg?.user_id) await bot.pickFriend(msg.user_id)?.markRead?.()
+    },
+    // 群聊已读 (NapCat 扩展)
+    mark_group_msg_as_read: async params => {
+      await bot.pickGroup(params.group_id)?.markRead?.()
+    },
+    // 私聊已读 (NapCat 扩展)
+    mark_private_msg_as_read: async params => {
+      await bot.pickFriend(params.user_id)?.markRead?.()
+    },
+    // 转发单条消息到群 (NapCat 扩展)：ICQQ 无原生接口，取原消息重新发送
+    forward_group_single_msg: async params => {
+      const msg = await fetchNativeMsg(bot, params.message_id)
+      sendRet = await bot.pickGroup(params.group_id).sendMsg(msg.message)
+    },
+    // 转发单条消息到私聊 (NapCat 扩展)
+    forward_friend_single_msg: async params => {
+      const msg = await fetchNativeMsg(bot, params.message_id)
+      sendRet = await bot.pickFriend(params.user_id).sendMsg(msg.message)
     },
     // 获取合并转发内容
     get_forward_msg: async params => {
       let id = params.id || params.message_id
-      if (id && typeof id === 'object') {
-        id = id.id || id.message_id || id.resid
-      }
-      logger.debug(`[ws-plugin] get_forward_msg 被调用, params: ${JSON.stringify(params)}, 解析出的 id: ${id}`)
-      
-      if (id) {
-        let dbMsg = await getMsg({ onebot_id: id })
-        if (dbMsg?.message_id) {
-          logger.debug(`[ws-plugin] get_forward_msg 数据库找到映射, onebot_id: ${id} => message_id/resid: ${dbMsg.message_id}`)
-          id = dbMsg.message_id
-        }
-      }
-      
-      let result = []
-      if (typeof bot.getForwardMsg === 'function') {
-        result = await bot.getForwardMsg(id)
-      } else {
-        const dummyFriend = bot.pickFriend?.(bot.uin || 0)
-        if (dummyFriend && typeof dummyFriend.getForwardMsg === 'function') {
-          result = await dummyFriend.getForwardMsg(id)
-        } else {
-          const dummyGroup = bot.pickGroup?.(0)
-          if (dummyGroup && typeof dummyGroup.getForwardMsg === 'function') {
-            result = await dummyGroup.getForwardMsg(id)
-          }
-        }
-      }
-      result = result || []
+      if (id && typeof id === 'object') id = id.id || id.message_id || id.resid
+      id = id == null ? '' : String(id)
+      let ctx = getResourceContext(id)
 
+      // 传入的若是「转发消息本身」的 onebot_id（NapCat 允许），取回原消息提取 resid
+      if (/^-?\d+$/.test(id)) {
+        try {
+          const mapping = await getMsg({ onebot_id: Number(id) })
+          if (mapping) {
+            const native = await resolveQuotedMessage(bot, mapping)
+            for (const seg of native?.message || []) {
+              const resid = (seg.type === 'multimsg' || seg.type === 'forward')
+                ? (seg.resid || seg.id)
+                : (seg.type === 'json' || seg.type === 'xml') ? extractForwardResid(seg.type, seg.data) : null
+              if (resid) {
+                id = String(resid)
+                ctx = { group_id: mapping.group_id || native.group_id, user_id: mapping.user_id || native.user_id }
+                break
+              }
+            }
+          }
+        } catch { }
+      }
+
+      // ICQQ-Plugin 的 pick 代理不绑定 this，优先取 raw 原始对象调用
+      const rawPick = p => p?.raw || p
+      const attempts = []
+      const groupIds = [...new Set([ctx?.group_id, params.group_id].filter(Boolean).map(Number))]
+      for (const gid of groupIds) attempts.push([`group:${gid}`, () => rawPick(bot.pickGroup(gid))?.getForwardMsg?.(id)])
+      const userIds = [...new Set([ctx?.user_id, params.user_id].filter(Boolean).map(Number))]
+      if (groupIds.length === 0) for (const uid of userIds) attempts.push([`friend:${uid}`, () => rawPick(bot.pickFriend(uid))?.getForwardMsg?.(id)])
+      attempts.push(['self', () => bot.getForwardMsg?.(id)])
+      if (groupIds.length === 0) {
+        // 来源未知（如重启前的消息）：群聊转发需按群下载，借用任意一个已加入的群尝试
+        const anyGroup = bot.gl?.keys?.().next?.().value
+        if (anyGroup) attempts.push([`group-any:${anyGroup}`, () => rawPick(bot.pickGroup(anyGroup))?.getForwardMsg?.(id)])
+      }
+
+      let result = []
+      let source = ''
+      const errors = []
+      for (const [tag, attempt] of attempts) {
+        try {
+          const ret = await attempt()
+          if (Array.isArray(ret) && ret.length > 0) { result = ret; source = tag; break }
+          errors.push(`${tag}=空`)
+        } catch (err) { errors.push(`${tag}=${err?.message || err}`) }
+      }
+      if (result.length === 0) {
+        logger.warn(`[ws-plugin] get_forward_msg 读取失败 resid=${id} 尝试: ${errors.join('; ')}`)
+      } else {
+        logger.mark(`[ws-plugin] get_forward_msg resid=${id} 来源=${source} 条数=${result.length}`)
+      }
+
+      const nestCtx = { group_id: ctx?.group_id || (source.startsWith('group') ? Number(source.split(':')[1]) : undefined), user_id: ctx?.user_id }
       let messages = []
       for (const item of result) {
         const itemMsg = item.message || item.content || []
         const sender = item.sender || {}
-        const onebotMsg = await msgToOneBotMsg(itemMsg)
+        // 传入来源会话，使嵌套合并转发的 resid 也能被记录
+        const onebotMsg = await msgToOneBotMsg(itemMsg, nestCtx)
+        const user_id = await getUser_id({ user_id: sender.user_id || item.user_id || 0 })
+        const nickname = sender.nickname || item.nickname || '未知用户'
         messages.push({
           message: onebotMsg,
-          content: MsgToCQ(onebotMsg),
+          content: onebotMsg,
           raw_message: MsgToCQ(onebotMsg),
-          sender: {
-            nickname: sender.nickname || item.nickname || "未知用户",
-            user_id: await getUser_id({ user_id: sender.user_id || item.user_id || 0 })
-          },
+          message_format: 'array',
+          user_id,
+          nickname,
+          sender: { nickname, user_id },
           time: item.time
         })
       }
       ResponseData = {
         messages
       }
-      logger.debug(`[ws-plugin] get_forward_msg 返回结果 messages 长度: ${messages.length}`)
     },
     // 发送合并转发
     send_forward_msg: async (params) => {
@@ -403,32 +530,22 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
       ret = await bot
         .pickGroup(params.group_id)
         .getChatHistory?.(seq, params.count);
-      if (Array.isArray(ret)) {
-        for (const msg of ret) {
-          try {
-            const message = await msgToOneBotMsg(msg.message)
-            messages.push({
-              time: msg.time,
-              message_type: 'group',
-              message_id: msg.rand || msg.message_id,
-              real_id: msg.seq,
-              sender: {
-                user_id: await getUser_id({ user_id: msg.user_id }),
-                nickname: msg.nickname || msg.sender?.nickname || '',
-                card: msg.sender?.card || '',
-                role: msg.sender?.role || 'member'
-              },
-              message,
-              raw_message: MsgToCQ(message)
-            })
-          } catch (e) {
-            // 跳过无法转换的消息
-          }
-        }
-      }
+      messages = await formatHistoryMessages(ret, 'group')
       ResponseData = {
         messages,
       };
+    },
+    // 获取好友消息历史记录 (go-cqhttp / NapCat 扩展)
+    get_friend_msg_history: async (params) => {
+      let time
+      if (params.message_seq || params.message_id) {
+        const dbMsg = await getMsg({ onebot_id: params.message_seq || params.message_id })
+        time = dbMsg?.time
+      }
+      const ret = await bot.pickFriend(params.user_id)?.getChatHistory?.(time, params.count || 20)
+      ResponseData = {
+        messages: await formatHistoryMessages(ret, 'private')
+      }
     },
 
     // 设置表情表态
@@ -922,6 +1039,10 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
     send_group_sign: async params => {
       await bot.sendGroupSign?.(params.group_id) || await bot.pickGroup(params.group_id)?.sign?.()
     },
+    // 群打卡 (NapCat 别名)
+    set_group_sign: async params => {
+      await bot.sendGroupSign?.(params.group_id) || await bot.pickGroup(params.group_id)?.sign?.()
+    },
     // 群设置匿名
     // B5修复: 添加ICQQ allowAnony fallback
     set_group_anonymous: async params => {
@@ -978,6 +1099,37 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
     // 群组踢人
     set_group_kick: async params => {
       await bot.setGroupKick?.(params.group_id, params.user_id, params.reject_add_request || false) || await bot.pickGroup(params.group_id)?.kickMember?.(params.user_id, params.reject_add_request || false)
+    },
+    // 批量踢人 (NapCat 扩展)
+    set_group_kick_members: async params => {
+      const ids = Array.isArray(params.user_id) ? params.user_id : [params.user_id]
+      for (const uid of ids) {
+        await bot.pickGroup(params.group_id)?.kickMember?.(Number(uid) || uid, params.reject_add_request || false)
+      }
+    },
+    // 获取群详细信息 (NapCat 扩展)：ICQQ 无独立接口，复用 get_group_info
+    get_group_info_ex: async params => {
+      await publicApi.get_group_info(params)
+    },
+    // 设置群备注 (NapCat 扩展)
+    set_group_remark: async params => {
+      await bot.pickGroup(params.group_id)?.setRemark?.(params.remark || '')
+    },
+    // 获取群禁言列表 (NapCat 扩展)
+    get_group_shut_list: async params => {
+      const now = Math.floor(Date.now() / 1000)
+      const map = await bot.pickGroup(params.group_id)?.getMemberMap?.() || bot.gml?.get?.(Number(params.group_id))
+      const list = []
+      for (const m of (map?.values?.() || [])) {
+        if (Number(m.shutup_time) > now) {
+          list.push({ ...m, user_id: await getUser_id({ user_id: m.user_id }), shut_up_timestamp: m.shutup_time })
+        }
+      }
+      ResponseData = list
+    },
+    // 获取群过滤系统消息 (NapCat 扩展)：ICQQ 不区分过滤消息，返回空
+    get_group_ignored_notifies: async params => {
+      ResponseData = { invited_requests: [], join_requests: [] }
     },
     // 退出群组
     set_group_leave: async params => {
@@ -1102,12 +1254,37 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
         folders
       }
     },
+    // 移动群文件 (NapCat 扩展)
+    move_group_file: async params => {
+      await bot.pickGroup(params.group_id).fs?.mv?.(params.file_id, params.target_dir_id || params.folder_id || '/')
+    },
+    // 重命名群文件 (NapCat 扩展)
+    rename_group_file: async params => {
+      await bot.pickGroup(params.group_id).fs?.rename?.(params.file_id, params.new_name || params.name)
+    },
     // 获取群文件资源链接
     get_group_file_url: async params => {
       let file = await bot.pickGroup(params.group_id).fs?.download?.(params.file_id)
       ResponseData = {
         url: file?.url
       }
+    },
+    // 获取私聊文件链接 (NapCat 扩展)
+    get_private_file_url: async params => {
+      ResponseData = {
+        url: await bot.pickFriend(params.user_id)?.getFileUrl?.(params.file_id)
+      }
+    },
+    // 获取文件 (NapCat 扩展)：根据上报时记录的来源会话取下载链接
+    get_file: async params => {
+      const file_id = params.file_id || params.file
+      const ctx = getResourceContext(file_id) || {}
+      const group_id = params.group_id || ctx.group_id
+      const user_id = params.user_id || ctx.user_id
+      let url
+      if (group_id) url = (await bot.pickGroup(group_id).fs?.download?.(file_id))?.url
+      else if (user_id) url = await bot.pickFriend(user_id)?.getFileUrl?.(file_id)
+      ResponseData = { file: file_id, file_id, url }
     },
     // 上传私聊文件
     upload_private_file: async params => {
@@ -1328,6 +1505,7 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
         message_id: onebot_id
       }
       if (sendRet.message_id) {
+        if (params.group_id) rememberGroupSeq(params.group_id, sendRet.seq, onebot_id)
         await setMsg({
           message_id: sendRet.message_id,
           time: sendRet.time,
@@ -1337,6 +1515,10 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
           group_id: params.group_id,
           onebot_id
         })
+      }
+      // Sakura 依赖 message_sent 记录机器人自己的发言（ICQQ 不推送自身群消息）
+      if (/^send_(group_|private_)?(msg|forward_msg)$/.test(api)) {
+        await reportSelfSent({ api, params, uin, bot, onebot_id, sendRet })
       }
     }
     const del = ['bot', 'group', 'friend', 'member', 'guild', 'channel']
@@ -1350,6 +1532,7 @@ async function getApiData (api, params = {}, name, uin, adapter, other = {}) {
     return ResponseData
   } else {
     logger.warn(`[ws-plugin] 未适配的api: ${api}`)
+    throw { message: `不支持的API: ${api}`, noLog: true }
   }
 }
 

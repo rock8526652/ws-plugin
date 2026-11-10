@@ -1,5 +1,6 @@
 import { sendSocketList, Config, Version } from '../../components/index.js'
 import { setMsg, getMsg, getGroup_id, getUser_id } from '../../model/index.js'
+import { findOnebotIdBySeq } from '../../model/SakuraCompat.js'
 
 Bot.on('notice', async e => {
     if (Config.muteStop && (e.group?.mute_left > 0 || e.group?.all_muted)) return false
@@ -112,6 +113,19 @@ Bot.on('notice', async e => {
                 other.sub_type = 'honor'
                 other.honor_type = e.honor_type || 'talkative'
                 break
+            // ICQQ 表情回应 → NapCat group_msg_emoji_like
+            case 'reaction': {
+                let onebot_id = findOnebotIdBySeq(e.group_id, e.seq)
+                if (onebot_id == null) {
+                    try { onebot_id = (await getMsg({ seq: e.seq, group_id: e.group_id }))?.onebot_id } catch { }
+                }
+                other.notice_type = 'group_msg_emoji_like'
+                other.message_id = onebot_id ?? e.seq
+                other.message_seq = e.seq
+                other.is_add = e.set !== false
+                other.likes = [{ emoji_id: String(e.id), count: 1 }]
+                break
+            }
             default:
                 return false
         }
@@ -129,6 +143,14 @@ Bot.on('notice', async e => {
                 other.notice_type = 'friend_recall'
                 const message_id = await getMsg({ message_id: e.message_id, user_id: e.user_id })
                 other.message_id = message_id?.onebot_id || e.rand
+                break
+            // 好友戳一戳
+            case 'poke':
+                other.notice_type = 'notify'
+                other.sub_type = 'poke'
+                other.user_id = await getUser_id({ user_id: e.operator_id || e.user_id })
+                other.target_id = await getUser_id({ user_id: e.target_id || e.self_id })
+                other.sender_id = other.user_id
                 break
             default:
                 return false
